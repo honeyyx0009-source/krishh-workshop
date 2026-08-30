@@ -75,8 +75,20 @@ private:
          lot = room;
 
       //--- (c) broker normalisation (min/max/step). Always last.
+      //    NormalizeLot rounds UP to the broker volume minimum. If the
+      //    remaining exposure room is a fraction below vmin, normalising
+      //    would return a lot slightly ABOVE max_basket_exposure_lots and
+      //    breach the cap. To keep the total-exposure ceiling strict, we
+      //    treat "room < broker vmin" as "cannot add" (return 0) instead
+      //    of normalising above the cap. Holding here is the designed
+      //    out-of-room state; it never realises a loss.
       if(m_om!=NULL)
+        {
+         double vmin = SymbolInfoDouble(m_symbol,SYMBOL_VOLUME_MIN);
+         if(vmin>0.0 && room < vmin)
+            return(0.0);
          lot = m_om.NormalizeLot(lot);
+        }
 
       return(lot);
      }
@@ -123,6 +135,18 @@ public:
       double risk_ccy = equity * m_profile.risk_percent_per_trade / 100.0;
 
       double point      = SymbolInfoDouble(m_symbol,SYMBOL_POINT);
+      //--- BROKER-CONTRACT ASSUMPTION (verify during backtest):
+      //    The risk-per-lot below is derived from SYMBOL_TRADE_TICK_VALUE
+      //    and SYMBOL_TRADE_TICK_SIZE. For gold (XAUUSD) these vary by
+      //    broker/feed: some quote tick value per-ounce, others per
+      //    100-oz contract, and account-currency conversion may apply.
+      //    If your broker's contract size differs from what the terminal
+      //    reports here, the ATR-stop notional may not match the intended
+      //    risk_percent_per_trade. ALWAYS verify the seed lot against your
+      //    broker's contract specs in the Strategy Tester before going
+      //    live. The guard below (tick_value>0 && tick_size>0) defensively
+      //    falls back to base_lot when the terminal returns zero/invalid
+      //    tick data, so we never divide by zero or size on garbage.
       double tick_value = SymbolInfoDouble(m_symbol,SYMBOL_TRADE_TICK_VALUE);
       double tick_size  = SymbolInfoDouble(m_symbol,SYMBOL_TRADE_TICK_SIZE);
       if(point<=0.0) point=_Point;

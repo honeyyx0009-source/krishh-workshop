@@ -103,6 +103,17 @@ private:
    double          m_hedge_trigger_dd_pct; // Basket DD% (vs equity) that arms a hedge
    bool            m_hedged_flag;    // Have we already placed the hedge for this basket?
 
+   //--- ANTI-RESTACK THROTTLE (issue #3). Even though every add is
+   //    bounded by the exposure + grid-depth caps, a fast/gapping adverse
+   //    move could otherwise stack several averaging levels within a
+   //    single bar before the weighted-average catches up. We space adds
+   //    deterministically: the next averaging add must be at least one
+   //    adaptive step beyond the LAST add's price AND on a new bar. This
+   //    only throttles ENTRIES; it never forces a close and never blocks
+   //    the profit-taking path.
+   double          m_last_add_price; // price of the most recent averaging add (0 = none)
+   datetime        m_last_add_bar;   // bar-open time of the most recent averaging add
+
    void            LogInfo(const string m) { if(m_log!=NULL) m_log.Info(m); }
    void            LogWarn(const string m) { if(m_log!=NULL) m_log.Warn(m); }
    void            LogDbg(const string m)  { if(m_log!=NULL) m_log.Debug(m); }
@@ -138,6 +149,59 @@ private:
       return(buy_vol>=sell_vol ? GRID_BUY : GRID_SELL);
      }
 
+   //--- Bar-open time of the current bar (for the new-bar throttle).
+   datetime        CurrentBarTime(void) const
+     {
+      if(m_om==NULL) return(0);
+      datetime t[];
+      if(CopyTime(m_om.Symbol(),PERIOD_CURRENT,0,1,t)==1)
+         return(t[0]);
+      return(0);
+     }
+
+   //--- ANTI-RESTACK guard: return true only when a new averaging add is
+   //    allowed. The first add on a fresh basket is always allowed (no
+   //    prior stamp). Subsequent adds require BOTH (a) a new bar since the
+   //    last add and (b) price at least one adaptive step beyond the last
+   //    add price, so adds are spaced by at least one step deterministically
+   //    even in a fast move. This is purely an entry throttle.
+   bool            AveragingSpacingOK(const MarketContext &mc,
+                                      const ENUM_GRID_DIRECTION dir) const
+     {
+      if(m_last_add_price<=0.0) return(true);        // no prior add -> allow
+
+      //--- (a) one add per bar at most
+      datetime bar = CurrentBarTime();
+      if(bar!=0 && bar==m_last_add_bar)
+         return(false);
+
+      //--- (b) at least one adaptive step beyond the last add price
+      if(m_grid!=NULL)
+        {
+         double step_points = m_grid.AdaptiveStepPoints(mc);
+         double point = SymbolInfoDouble(m_om.Symbol(),SYMBOL_POINT);
+         if(point<=0.0) point=_Point;
+         double step_price = step_points*point;
+         double px = (dir==GRID_BUY ? mc.bid : mc.ask);
+         if(dir==GRID_BUY)
+           {
+            if(px > m_last_add_price - step_price) return(false); // not a full step lower yet
+           }
+         else
+           {
+            if(px < m_last_add_price + step_price) return(false); // not a full step higher yet
+           }
+        }
+      return(true);
+     }
+
+   //--- Record an averaging add so the throttle can space the next one.
+   void            StampAveragingAdd(const double price)
+     {
+      m_last_add_price = price;
+      m_last_add_bar   = CurrentBarTime();
+     }
+
 public:
                    CRecoveryEngine(void)
      {
@@ -153,6 +217,8 @@ public:
       m_hedge_enabled         = false;
       m_hedge_trigger_dd_pct  = 15.0;
       m_hedged_flag           = false;
+      m_last_add_price        = 0.0;
+      m_last_add_bar          = 0;
      }
                   ~CRecoveryEngine(void) {}
 
@@ -190,7 +256,12 @@ public:
      }
 
    //--- Reset per-basket state (call when a basket has just closed).
-   void            ResetBasketState(void) { m_hedged_flag=false; }
+   void            ResetBasketState(void)
+     {
+      m_hedged_flag    = false;
+      m_last_add_price = 0.0;   // clear the anti-restack stamp for the next basket
+      m_last_add_bar   = 0;
+     }
 
    //================================================================//
    //  GROUP TAKE-PROFIT TARGET CHECK                                //
@@ -218,7 +289,30 @@ public:
          bool ok=false;
          ENUM_GRID_DIRECTION dir = BasketDirection(ok);
          if(!ok) return(false);
-         double be = m_om.WeightedAvgEntry(dir);
+
+         //--- Break-even basis:
+         //    * one-sided basket -> the side's weighted-average entry is
+         //      the true break-even.
+         //    * hedged basket (both legs open) -> a single side's average
+         //      is NOT the break-even. Net both legs so the points target
+         //      is measured from the real net-basket break-even. If the
+         //      basket is netted flat (no meaningful net exposure), a
+         //      points target is undefined, so we defer to the pnl>0 guard
+         //      and simply do not fire in points mode (currency mode would
+         //      handle a netted basket correctly). We never force a loss.
+         double be = 0.0;
+         bool have_sell = (m_om.WeightedAvgEntry(GRID_SELL) > 0.0);
+         bool have_buy  = (m_om.WeightedAvgEntry(GRID_BUY)  > 0.0);
+         if(have_buy && have_sell)
+           {
+            bool be_ok=false;
+            be = m_om.NetBasketBreakEven(dir,be_ok);
+            if(!be_ok) return(false);           // netted/flat -> no points target
+           }
+         else
+           {
+            be = m_om.WeightedAvgEntry(dir);    // one-sided: single-side avg is correct
+           }
          if(be<=0.0) return(false);
          double point = SymbolInfoDouble(m_om.Symbol(),SYMBOL_POINT);
          if(point<=0.0) point=_Point;
@@ -315,23 +409,38 @@ public:
         }
       double avg = m_om.WeightedAvgEntry(dir);
 
+      //--- LEVEL INDEX = positions on the RECOVERY SIDE only, NOT the
+      //    total basket count. Using the total count would let an
+      //    opposite-side hedge leg inflate the martingale exponent
+      //    (base_lot * factor^level) and prematurely consume
+      //    max_grid_levels. The grid depth and progression must reflect
+      //    only how deep we are on the side we are actually averaging.
+      int side_level = m_om.CountSidePositions(dir);
+
       //--- (2) AVERAGING: only when price is adverse by one adaptive step
       //    AND there is grid depth + exposure room. We DO NOT send here;
       //    we return an intent for the main EA to gate + execute.
       if(m_grid!=NULL && m_lot!=NULL &&
-         m_grid.PriceMovedOneStepAdverse(mc,dir,avg))
+         m_grid.PriceMovedOneStepAdverse(mc,dir,avg) &&
+         AveragingSpacingOK(mc,dir))
         {
-         GridIntent gi = m_grid.BuildNextLevelIntent(mc,dir,avg,count);
+         GridIntent gi = m_grid.BuildNextLevelIntent(mc,dir,avg,side_level);
          if(gi.valid)
            {
-            double lot = m_lot.RecoveryLot(mc,dir,count);
+            double lot = m_lot.RecoveryLot(mc,dir,side_level);
             if(lot>0.0)
               {
                rd.action = RECOVERY_ADD_AVERAGING;
                rd.intent = gi;
                rd.lot    = lot;
-               rd.detail = StringFormat("averaging add proposed: %s %.2f lots @ %.2f (level %d)",
-                                        (dir==GRID_BUY?"BUY":"SELL"),lot,gi.price,count);
+               rd.detail = StringFormat("averaging add proposed: %s %.2f lots @ %.2f (side level %d)",
+                                        (dir==GRID_BUY?"BUY":"SELL"),lot,gi.price,side_level);
+               //--- stamp this proposal so the anti-restack throttle spaces
+               //    the next add by at least one adaptive step / bar. We
+               //    stamp on PROPOSAL (the main EA gates+sends immediately
+               //    after); worst case a blocked send simply delays the
+               //    next add, which is safe (never forces a loss).
+               StampAveragingAdd(gi.price);
                LogDbg("RecoveryEngine: "+rd.detail);
                return(rd);
               }
@@ -359,7 +468,11 @@ public:
          if(basket_dd >= m_hedge_trigger_dd_pct)
            {
             ENUM_GRID_DIRECTION hedge_dir = (dir==GRID_BUY ? GRID_SELL : GRID_BUY);
-            double hedge_lot = m_lot.RecoveryLot(mc,hedge_dir,0); // seed-level bounded lot
+            //--- The hedge leg is sized at the hedge SIDE's own level, not
+            //    the total basket count, so an existing recovery side does
+            //    not inflate the hedge's martingale exponent.
+            int hedge_level = m_om.CountSidePositions(hedge_dir);
+            double hedge_lot = m_lot.RecoveryLot(mc,hedge_dir,hedge_level);
             if(hedge_lot>0.0)
               {
                GridIntent hi;
@@ -367,7 +480,7 @@ public:
                hi.direction   = hedge_dir;
                hi.price       = (hedge_dir==GRID_BUY ? mc.ask : mc.bid);
                hi.is_seed     = false;
-               hi.level_index = count;
+               hi.level_index = hedge_level;
                hi.step_points = 0.0;
                hi.reason      = "hedge";
                rd.action = RECOVERY_ADD_HEDGE;

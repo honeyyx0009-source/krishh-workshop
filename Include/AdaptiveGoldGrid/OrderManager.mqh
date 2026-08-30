@@ -248,10 +248,19 @@ public:
       return(OpenPending(dir==GRID_BUY?ORDER_TYPE_BUY_STOP:ORDER_TYPE_SELL_STOP,lot,price,comment));
      }
 
-   //--- True when no trade operation is currently in flight.
+   //--- True when it is safe to attempt a trade send this instant.
+   //    We check both the EA-stop flag and the terminal's trade-context
+   //    availability (TERMINAL_TRADE_ALLOWED). CTrade already serialises
+   //    the actual send, so this is a best-effort pre-check to avoid
+   //    spinning when trading is globally disabled or the EA is being
+   //    torn down. It is read-only and never closes/forces anything.
    bool              IsTradeContextFree(void) const
      {
-      return(!IsStopped());
+      if(IsStopped())
+         return(false);
+      if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+         return(false);
+      return(true);
      }
 
    //================================================================//
@@ -280,6 +289,45 @@ public:
             cnt++;
         }
       return(cnt);
+     }
+
+   //--- Count of open positions on ONE side of the basket only.
+   //    Used by the RecoveryEngine as the martingale/grid LEVEL INDEX so
+   //    an opposite-side hedge leg does not inflate the progression
+   //    exponent or consume grid depth on the recovery side.
+   int               CountSidePositions(const ENUM_GRID_DIRECTION dir) const
+     {
+      ENUM_POSITION_TYPE want = (dir==GRID_BUY ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
+      int cnt=0;
+      int total=PositionsTotal();
+      for(int i=0;i<total;i++)
+        {
+         ulong tk=PositionGetTicket(i);
+         if(tk==0) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=m_magic) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=m_symbol) continue;
+         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=want) continue;
+         cnt++;
+        }
+      return(cnt);
+     }
+
+   //--- Summed volume of one side of the basket.
+   double            SideVolume(const ENUM_GRID_DIRECTION dir) const
+     {
+      ENUM_POSITION_TYPE want = (dir==GRID_BUY ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
+      double v=0.0;
+      int total=PositionsTotal();
+      for(int i=0;i<total;i++)
+        {
+         ulong tk=PositionGetTicket(i);
+         if(tk==0) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=m_magic) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=m_symbol) continue;
+         if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE)!=want) continue;
+         v+=PositionGetDouble(POSITION_VOLUME);
+        }
+      return(v);
      }
 
    //--- Summed volume of the whole basket.
@@ -358,6 +406,45 @@ public:
          den+=vol;
         }
       return(den>0.0 ? num/den : 0.0);
+     }
+
+   //--- NET-BASKET break-even price across BOTH legs.
+   //    A single side's weighted-average entry is only the break-even
+   //    when the basket is one-sided. Once a hedge is open the true net
+   //    break-even must net the opposite leg. We compute the price at
+   //    which the combined buy/sell P&L is zero:
+   //        net_lots = buy_vol - sell_vol   (signed net exposure)
+   //        For BUY-net:  P&L(price) = (price - buy_avg)*buy_vol
+   //                                 - (price - sell_avg)*sell_vol = 0
+   //        => price = (buy_avg*buy_vol - sell_avg*sell_vol) / net_lots
+   //    `ok` is false and 0.0 returned when the basket is flat/netted
+   //    (net_lots ~ 0), because then no single price flips the sign and
+   //    a points-based target is meaningless (currency-mode TP handles
+   //    that case correctly). This is PURELY a target calculation; it
+   //    never triggers a close by itself.
+   double            NetBasketBreakEven(const ENUM_GRID_DIRECTION net_dir,bool &ok) const
+     {
+      ok=false;
+      double buy_vol  = SideVolume(GRID_BUY);
+      double sell_vol = SideVolume(GRID_SELL);
+      double buy_avg  = WeightedAvgEntry(GRID_BUY);
+      double sell_avg = WeightedAvgEntry(GRID_SELL);
+
+      double net_lots = buy_vol - sell_vol;   // >0 net long, <0 net short
+      //--- require a meaningful net exposure to define a break-even price
+      double vstep = SymbolInfoDouble(m_symbol,SYMBOL_VOLUME_STEP);
+      if(vstep<=0.0) vstep = 0.01;
+      if(MathAbs(net_lots) < vstep*0.5)
+         return(0.0);                          // netted flat -> no BE price
+
+      //--- direction sanity: net side must match the requested net_dir
+      if(net_dir==GRID_BUY  && net_lots<=0.0) return(0.0);
+      if(net_dir==GRID_SELL && net_lots>=0.0) return(0.0);
+
+      double be = (buy_avg*buy_vol - sell_avg*sell_vol) / net_lots;
+      if(be<=0.0) return(0.0);
+      ok=true;
+      return(be);
      }
 
    //================================================================//
