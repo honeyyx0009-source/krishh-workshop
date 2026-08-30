@@ -44,6 +44,7 @@
 #include <AdaptiveGoldGrid/GridEngine.mqh>
 #include <AdaptiveGoldGrid/LotSizer.mqh>
 #include <AdaptiveGoldGrid/RecoveryEngine.mqh>
+#include <AdaptiveGoldGrid/MLHook.mqh>
 
 //+------------------------------------------------------------------+
 //|                        INPUT PARAMETERS                          |
@@ -79,9 +80,10 @@ input group "=== Hedging (optional) ==="
 input bool                EnableHedge      = false;          // Enable the optional opposite-side hedge action
 input double              HedgeTriggerDDPct= 15.0;           // Arm hedge when basket floating DD >= this % of equity
 
-//--- Reserved: ONNX ML (implemented in a later feature) -------------
-input group "=== Reserved: ONNX ML (placeholder) ==="
-input bool                EnableOnnxML     = false;          // RESERVED placeholder - ML module ships separately; gates nothing yet
+//--- Optional Phase-2 ONNX ML hook (OFF by default) -----------------
+input group "=== Optional ONNX ML (Phase-2, default OFF) ==="
+input bool                EnableOnnxML     = false;          // Enable optional ONNX inference (advisory only; NEVER bypasses SafetyValve)
+input string              OnnxModelFile    = "";             // User-supplied .onnx model under MQL5/Files (empty => stays NEUTRAL)
 
 //--- Advanced manual overrides --------------------------------------
 input group "=== Advanced Overrides (leave off to use preset) ==="
@@ -105,6 +107,7 @@ CMarketAnalysis  g_market;
 CGridEngine      g_grid;
 CLotSizer        g_lots;
 CRecoveryEngine  g_recovery;
+CMLHook          g_ml;               // Optional Phase-2 ONNX inference hook (OFF by default)
 
 PresetProfile    g_profile;          // Resolved active profile
 datetime         g_last_bar_time = 0;// New-bar detector
@@ -247,8 +250,10 @@ int OnInit(void)
    g_recovery.ConfigureTP(BasketTPMode,BasketTPCurrency,BasketTPPoints,BasketTPPerLot);
    g_recovery.ConfigureHedge(EnableHedge,HedgeTriggerDDPct);
 
-   if(EnableOnnxML)
-      g_logger.Warn("EnableOnnxML=true but the ONNX ML module is not part of this build; toggle is a reserved placeholder and gates nothing.");
+   //--- Optional Phase-2 ONNX hook. Disabled by default; a disabled
+   //    hook returns NEUTRAL for every Predict() so the classical logic
+   //    below is completely unchanged. It can NEVER bypass the SafetyValve.
+   g_ml.Init(EnableOnnxML,OnnxModelFile,GetPointer(g_logger));
 
    g_logger.Info("OnInit complete. EA armed.");
    return(INIT_SUCCEEDED);
@@ -261,6 +266,8 @@ void OnDeinit(const int reason)
   {
    //--- Release indicator handles so the terminal does not leak them.
    g_market.Deinit();
+   //--- Release the optional ONNX model handle (no-op when disabled).
+   g_ml.Release();
    g_logger.Info(StringFormat("OnDeinit: reason=%d. Handles released. (Open positions are left untouched.)",reason));
   }
 
@@ -320,6 +327,25 @@ void OnTick(void)
    GridIntent seed = g_grid.BuildSeedIntent(mc);
    if(!seed.valid)
       return;   // no decisive bias yet -> wait
+
+   //--- (3a) OPTIONAL ML CONFIRMATION FILTER (advisory only).
+   //    When the ONNX hook is inactive (the default) Predict() returns a
+   //    NEUTRAL/inactive result and this block is a no-op: the classical
+   //    seed proceeds exactly as in Phase-1. When active, the model may
+   //    only VETO a classical seed that disagrees with its direction; it
+   //    can never CREATE an entry and never reaches OrderSend on its own.
+   //    The SafetyValve gate below still applies unconditionally.
+   MLPrediction mlp = g_ml.Predict(mc);
+   if(mlp.active && mlp.opinion!=ML_NEUTRAL)
+     {
+      bool ml_agrees = (seed.direction==GRID_BUY  && mlp.opinion==ML_BULLISH) ||
+                       (seed.direction==GRID_SELL && mlp.opinion==ML_BEARISH);
+      if(!ml_agrees)
+        {
+         g_logger.Info(StringFormat("Seed VETOED by ONNX ML (conf=%.2f) - direction disagreement; classical bias skipped this bar.",mlp.confidence));
+         return;   // ML disagrees -> skip the seed (still no forced trade)
+        }
+     }
 
    double seed_lot = g_lots.SeedLot(mc);
    if(seed_lot<=0.0)
