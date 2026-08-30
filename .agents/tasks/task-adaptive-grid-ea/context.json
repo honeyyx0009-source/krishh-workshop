@@ -1,0 +1,28 @@
+{
+  "project_type": "MetaTrader 5 (MT5) Expert Advisor (trading robot) written in MQL5. Adaptive grid + basket-recovery (martingale-style) EA for XAUUSD (gold), designed for 24/7 operation. Backtest-first, not presumed for live deployment.",
+  "language": "MQL5 (.mq5 main EA, .mqh modular include files)",
+  "build_system": "MetaEditor (MetaTrader 5). Compilation produces a .ex5 from .mq5. There is NO command-line build available in this sandbox (no metaeditor64.exe, no wine, no MT5). Build/compile must be done by the user inside MetaEditor.",
+  "test_framework": "MT5 Strategy Tester (visual + optimization). No unit-test framework exists for MQL5 in this environment. Verification here is by-inspection only (structure, MQL5 syntax/API correctness, logic review).",
+  "build_command": "USER-SIDE ONLY: Open the .mq5 in MetaEditor and press F7 (Compile). Not runnable in this sandbox.",
+  "test_command": "USER-SIDE ONLY: MT5 Strategy Tester on XAUUSD, M5/M15, 'Every tick based on real ticks'. Not runnable in this sandbox.",
+  "verification_instructions": "In-sandbox verification is limited to static inspection: (1) confirm every module has matching #ifndef/#define/#endif include guards; (2) confirm all #include paths resolve within the MQL5/Include tree layout; (3) confirm the main .mq5 declares OnInit/OnTick/OnDeinit and input block; (4) confirm CTrade usage, MqlTradeRequest/Result handling, and lot normalization against SymbolInfoDouble volume min/max/step; (5) confirm no obvious undeclared identifiers by cross-checking function signatures across modules. Runtime/compile verification is explicitly deferred to the user in MetaEditor + Strategy Tester and MUST be stated as such in deliverables.",
+  "snapshot_or_generated_files": "None. MetaEditor produces a .ex5 binary from the .mq5 but that is a user-side build artifact and must NOT be committed.",
+  "setup_instructions": "No sandbox setup needed for authoring. User setup: copy the folder under <MT5 data folder>/MQL5/Experts/AdaptiveGoldGrid/ (and includes under the same tree using relative includes), refresh Navigator in MetaEditor, compile the main .mq5.",
+  "environment_constraints": "Network mode allows external access (mql5.com reachable) but MT5/MetaEditor/wine are NOT installed, so the EA CANNOT be compiled or backtested in this sandbox. Do NOT claim runtime or compile verification. All validation here is by inspection of MQL5 source. ML (LSTM/CNN/GRU) cannot be trained in MQL5; only ONNX inference via OnnxRun is possible and is OPTIONAL Phase-2, stubbed with clear TODO markers in Phase 1.",
+  "contribution_requirements": "No CONTRIBUTING.md exists (fresh repo, only README.md 'MT5 ROBOT'). Follow standard MQL5 conventions: relative #include \"...\" paths, include guards, CTrade from <Trade/Trade.mqh>, input/sinput declarations, magic-number isolation, defensive OrderSend with retcode handling.",
+  "key_patterns": "Modular MQL5: main .mq5 orchestrates via OnInit/OnTick/OnDeinit and owns global input block; logic split into .mqh classes/namespaces. Use CTrade wrapper. Preset system via enum selecting a struct of tuned parameters. Basket = all EA positions on the symbol sharing the magic number, managed as a group for group-take-profit. Safety valve gates NEW OrderSend calls only (checks AccountInfoDouble margin level / free margin) and NEVER force-closes at a loss. ATR-based dynamic grid spacing; volatility/condition-driven lot progression capped per preset exposure limits.",
+  "relevant_files": [
+    "Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5 (main EA)",
+    "Include/AdaptiveGoldGrid/Config.mqh (enums, preset table, input-backed CConfig)",
+    "Include/AdaptiveGoldGrid/Logger.mqh (leveled logging)",
+    "Include/AdaptiveGoldGrid/MarketAnalysis.mqh (RSI/MACD/ATR/MA/S-R/price-action)",
+    "Include/AdaptiveGoldGrid/GridEngine.mqh (adaptive spacing + level generation)",
+    "Include/AdaptiveGoldGrid/LotSizer.mqh (adaptive/progressive lot sizing, broker normalization)",
+    "Include/AdaptiveGoldGrid/RecoveryEngine.mqh (basket group-TP, averaging, optional hedge)",
+    "Include/AdaptiveGoldGrid/SafetyValve.mqh (margin/exposure gate + DD circuit breaker, entry-blocking only)",
+    "Include/AdaptiveGoldGrid/OrderManager.mqh (CTrade wrapper, defensive OrderSend, basket queries)",
+    "Include/AdaptiveGoldGrid/MLHook.mqh (OPTIONAL Phase-2 ONNX inference stub with TODOs)",
+    "README.md (architecture, inputs, preset table, risk warnings, compile/backtest steps)"
+  ],
+  "directory_structure": "Repo root holds README.md and the source tree mirroring the MT5 MQL5 folder: Experts/AdaptiveGoldGrid/ for the main .mq5, Include/AdaptiveGoldGrid/ for the .mqh modules. Relative includes so it drops cleanly into <MT5>/MQL5/. .agents/tasks/ holds planning state."
+}
