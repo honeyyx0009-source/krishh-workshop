@@ -201,8 +201,10 @@ public:
       //             classical context) - that would be mislabelling classical
       //             signals as ML, which is explicitly forbidden.
       // Until all four steps exist, we return NEUTRAL so nothing changes.
+      // The `mc` parameter is intentionally unused until Phase-2 uses the
+      // context for input-tensor shaping; it stays in the signature as it
+      // is part of the public API.
       // ----------------------------------------------------------------
-      (void)mc;   // silence "unused" until Phase-2 uses the context for shaping
       return(Neutral());
      }
 
