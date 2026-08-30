@@ -1,252 +1,310 @@
-# Adaptive Gold Grid EA (XAUUSD)
+# Adaptive Gold Grid EA (XAUUSD) — v2
 
-A preset-driven, institutional-style **adaptive grid + basket-recovery (bounded martingale)** Expert Advisor for MetaTrader 5, tuned for **XAUUSD (gold)** and designed for continuous 24/7 operation.
+A preset-driven **adaptive grid + ACTIVE basket recovery (bounded martingale)** Expert Advisor for MetaTrader 5, tuned for **XAUUSD (gold)** and designed for continuous 24/7 operation.
 
-The EA reads classical multi-indicator + price-action context, seeds a grid basket with structure bias, adapts its spacing to volatility, and manages the whole basket as one group with a single goal: **bring the group back to a net profit and close it in profit**. Risk control is deliberately **entry-side only**: the Safety Valve blocks *new* exposure when the account is stressed but never force-closes a losing trade and never halts the EA.
+The EA reads a higher-timeframe **regime filter** to decide whether a grid is appropriate at all, seeds a basket with structure bias, adapts its spacing to volatility, and then manages the whole basket **actively** — time-decayed profit targets, trailing, partial harvesting, and a bounded stop — instead of holding and hoping.
 
 ---
 
-## 1. Overview & Honest Disclaimer
+## 1. Why v2 exists (read this first)
 
-- **Backtest first, always.** Nothing in this repository has been run, compiled, or backtested inside the build environment (there is no MetaTrader 5, MetaEditor, or wine here). Compilation and Strategy Tester backtesting are **your responsibility**. See section 10.
-- **This is not financial advice.** Grid and martingale-style systems can be profitable in ranging conditions and dangerous in strong trends. You are responsible for your own capital, broker choice, and risk decisions.
-- **"Always closes in profit" is a design goal, not a guarantee.** The recovery model is built to only ever *close* a basket when it is in net profit. That does not mean the account cannot be wiped out first. See the RISK WARNING in section 7.
-- **No AI/ML claims by default.** The default build uses ordinary deterministic indicators. The optional ONNX hook (section 8) is disabled by default and does nothing until you supply and wire your own trained model.
+**v1 blew up a $1000 demo account on gold in two days using `PRESET_MICRO`.** That was a real defect, not bad luck. Three causes, all fixed:
+
+| # | v1 defect | v2 fix |
+|---|---|---|
+| 1 | **Counter-trend entry + averaging.** v1 picked its side from a fast M15 EMA pair, so a brief flicker inside a larger trend was enough to seed against it — then it kept averaging into that trend. | New **`RegimeFilter.mqh`**: a higher-timeframe ADX/EMA/ATR gate that refuses counter-trend seeds **and refuses to enlarge a basket that opposes a dominant trend.** |
+| 2 | **Over-sized exposure.** `PRESET_MICRO` allowed `0.50` basket lots. On gold that let a **$77** adverse move erase a $1000 account. | Every preset retuned to **~0.02 lots per $1000 equity**, new **`PRESET_NANO`** for ~$1000 accounts, plus optional **capital-aware auto-sizing**. |
+| 3 | **Passive "hold forever" recovery.** v1 could only wait for the market to return, so baskets sat stuck for weeks while the loss grew. | Recovery is now **ACTIVE**: time-decay TP, basket trailing, partial harvesting, and a bounded **basket stop**. |
+
+### The gold contract math that caused the blow-up
+
+```
+1.00 lot XAUUSD = 100 oz   =>   a $1 gold move = $100 P&L
+0.01 lot XAUUSD            =>   a $1 gold move = $1   P&L
+
+basket loss  ~=  exposure_lots x 100 x adverse_move_in_dollars
+```
+
+v1 `PRESET_MICRO` (0.50 lot basket cap, 6 levels) permitted roughly **0.13 lots** of real exposure on a $1000 account. Gold routinely travels **$100–150 in a couple of days**. `0.13 x 100 x 77 = $1001`. The account was arithmetically dead before the market did anything unusual.
+
+### The honest trade-off you must accept
+
+v2 **deliberately reverses** the v1 rule of *"never close at a loss."*
+
+> **"Never realise a loss" and "never get stuck" cannot both be true.** If the market does not come back, your only two options are a **bounded loss now** or an **unbounded loss later**. v1 chose the second and the account died. v2 chooses the first, by default.
+
+The basket stop is an input and you *can* disable it — but doing so restores the exact v1 failure mode, and the EA will log a warning at startup if you do.
+
+### What this EA does NOT do
+
+**There is no system that profits regardless of which way the market moves.** Hedging both directions on one instrument nets your exposure to zero while you still pay spread, commission and swap — a guaranteed small loss. If such a system existed, markets would not. This EA does not pretend otherwise, and it does not hide floating losses to make an equity curve look green.
 
 ---
 
 ## 2. Architecture
 
-All engine modules live under `MQL5/Include/AdaptiveGoldGrid/` and are pulled into the main EA (`MQL5/Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5`) with angle-bracket includes such as `#include <AdaptiveGoldGrid/Config.mqh>`.
+Modules live under `MQL5/Include/AdaptiveGoldGrid/`; the EA is `MQL5/Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5` and pulls them in with angle-bracket includes (`#include <AdaptiveGoldGrid/Config.mqh>`).
 
 | Module | Responsibility |
 |---|---|
-| **Config.mqh** | The single source of truth for all tuned numbers. Defines `ENUM_ACCOUNT_PRESET`, the `PresetProfile` struct, and `CConfig` which returns a fully tuned profile per preset. |
-| **Logger.mqh** | Dependency-free leveled logger (ERROR/WARN/INFO/DEBUG) with optional file output. Included by every other module without creating circular dependencies. |
-| **OrderManager.mqh** | Defensive `CTrade` wrapper. Owns magic-number + symbol basket isolation, order sending with retcode handling, and basket queries (count, volume, floating PnL, weighted-average entry, basket close). Defines `ENUM_GRID_DIRECTION` (`GRID_BUY` / `GRID_SELL`). |
-| **SafetyValve.mqh** | The entry-blocking gate. Answers only "is it safe to open a NEW order right now?" using drawdown, margin level, free margin, and projected margin. It never closes, modifies, or halts anything. |
-| **MarketAnalysis.mqh** | Classical multi-indicator + price-action engine (RSI, MACD, ATR, fast/slow EMA, swing S/R). Produces a consolidated `MarketContext` struct. Explicitly **not** machine learning. |
-| **GridEngine.mqh** | Pure decision module for grid geometry. Computes ATR-based adaptive spacing, chooses seed direction from structure/momentum, and returns a `GridIntent` (never sends orders). |
-| **LotSizer.mqh** | Bounded adaptive/progressive lot sizing. Applies the martingale progression factor while enforcing the per-order cap, total-basket exposure cap, and broker volume normalization (min/max/step). |
-| **RecoveryEngine.mqh** | Basket-first group recovery. Checks the group take-profit, proposes bounded averaging adds, and optionally proposes a one-time hedge. Its only close is the profit-only `CloseBasket()`. |
-| **MLHook.mqh** | Optional Phase-2 ONNX **inference-only** hook. Disabled by default; returns a NEUTRAL "no opinion" result until you supply a trained `.onnx` model and complete the Phase-2 plumbing. Advisory only, can never bypass the Safety Valve. |
+| **Config.mqh** | Single source of truth for all tuned numbers. `ENUM_ACCOUNT_PRESET`, the `PresetProfile` struct (21 fields), and `CConfig`. |
+| **Logger.mqh** | Dependency-free leveled logger (ERROR/WARN/INFO/DEBUG) with optional file output. |
+| **OrderManager.mqh** | Defensive `CTrade` wrapper. Lot normalisation, margin checks, magic+symbol basket queries, basket age, most-profitable-leg lookup, and close **mechanism** (no policy). |
+| **SafetyValve.mqh** | Entry-blocking gate. Answers only *"is it safe to open a NEW order?"* using drawdown, margin level, free margin, projected margin. **Never closes, modifies or halts anything.** |
+| **MarketAnalysis.mqh** | Fast-timeframe classical engine (RSI, MACD, ATR, fast/slow EMA, swing S/R) → `MarketContext`. Explicitly **not** machine learning. |
+| **RegimeFilter.mqh** | **NEW in v2.** Higher-timeframe regime gate (ADX/±DI, EMA structure, ATR expansion) → `RegimeContext`. Answers `AllowSeed()` and `AllowAveraging()`. |
+| **GridEngine.mqh** | Pure geometry: ATR-based adaptive spacing, seed direction, S/R snapping. Returns intents, never sends. |
+| **LotSizer.mqh** | Bounded progressive sizing. Enforces per-order cap → basket exposure cap → broker min/max/step. |
+| **RecoveryEngine.mqh** | **Reworked in v2.** Active basket management: group TP (time-decayed), trailing, basket stop, partial harvest, regime-gated averaging, optional hedge. |
+| **MLHook.mqh** | Optional Phase-2 ONNX **inference-only** hook. Disabled by default, advisory, can never bypass the SafetyValve. |
 
-### How a tick flows through the system
+### How a tick flows
 
-1. **`OnTick`** refreshes the Safety Valve peak-equity baseline.
-2. **MarketAnalysis** rebuilds the `MarketContext` (on a new bar, or whenever a basket is open, or when context is stale). If context is not ready, the EA does nothing this tick.
-3. **If a basket exists → RecoveryEngine.Manage()** runs first (profit-first):
-   - Group TP reached → `CloseBasket()` closes the whole group **in profit**.
-   - Price moved one adaptive step adverse → propose an **averaging add** (bounded lot).
-   - Hedge enabled and basket drawdown armed → propose a **one-time hedge**.
-   - Otherwise → **hold** (a deliberate state, never a forced loss).
-4. **If no basket exists → seed a fresh one**: GridEngine builds a seed `GridIntent` from trend/momentum bias, LotSizer computes the bounded seed lot.
-5. **Optional ML confirmation filter** (only when the ONNX hook is active): the model may **veto** a classical seed whose direction it disagrees with. It can never create an entry.
-6. **Every new-order intent** (seed, averaging, hedge) is routed through **`ExecuteIntentGated()`**, which asks the **SafetyValve** and then OrderManager for margin room before any `OrderSend`. If blocked, the EA logs and holds; nothing is closed.
+1. `OnTick` refreshes the SafetyValve peak-equity baseline.
+2. **MarketAnalysis** rebuilds `MarketContext`. Not ready → do nothing.
+3. **RegimeFilter** rebuilds `RegimeContext` (higher TF). Not ready → do not open new exposure.
+4. **If a basket exists → `RecoveryEngine.Manage()`**, in strict priority order:
+   1. **Group TP** (age-decayed) → close the basket **in profit**.
+   2. **Trailing** → a fading win is banked **in profit**.
+   3. **Basket stop** → bounded loss, close and start fresh *(only if enabled)*.
+   4. **Partial harvest** → bank a profitable leg to cut exposure.
+   5. **Averaging** → **only if the regime still permits it**.
+   6. **Hedge** → optional, off by default.
+   7. **Hold**.
+5. **If no basket → seed one**: GridEngine proposes a direction, then **RegimeFilter.AllowSeed()** can refuse it, then the optional ML hook may veto it.
+6. **Every new-order intent** routes through `ExecuteIntentGated()` → **SafetyValve** → margin check → send.
 
-The critical invariant: **no order is ever sent without passing the SafetyValve gate, and the SafetyValve never closes or halts.**
-
----
-
-## 3. The Five Presets
-
-Pick one preset in the `AccountPreset` input. Values below are the exact defaults implemented in `Config.mqh`. Every downstream module reads its limits from this profile; nothing is hardcoded elsewhere.
-
-| Parameter | Micro | Medium | Large | BigLevel | Commercial |
-|---|---|---|---|---|---|
-| `base_lot` (first grid order) | 0.01 | 0.05 | 0.10 | 0.25 | 0.50 |
-| `max_grid_levels` | 6 | 8 | 10 | 12 | 15 |
-| `risk_percent_per_trade` (%) | 0.25 | 0.35 | 0.45 | 0.55 | 0.65 |
-| `lot_progression_factor` (martingale x) | 1.30 | 1.40 | 1.45 | 1.50 | 1.55 |
-| `max_lot_cap` (per-order hard cap) | 0.10 | 0.50 | 1.50 | 4.00 | 10.00 |
-| `max_basket_exposure_lots` (total exposure cap) | 0.50 | 2.50 | 8.00 | 25.00 | 75.00 |
-| `atr_spacing_multiplier` | 1.50 | 1.40 | 1.30 | 1.20 | 1.15 |
-| `max_drawdown_percent` (DD circuit breaker %) | 25.0 | 30.0 | 35.0 | 40.0 | 45.0 |
-| `margin_level_floor_percent` (margin floor %) | 400.0 | 350.0 | 300.0 | 250.0 | 200.0 |
-| `min_free_margin_currency` (acct ccy) | 20.0 | 100.0 | 500.0 | 2000.0 | 10000.0 |
-
-Notes:
-- The martingale progression is **always bounded**: `lot_progression_factor` scales each deeper lot, but `max_lot_cap` caps any single order and `max_basket_exposure_lots` caps the summed basket volume. No preset allows unbounded doubling.
-- Micro is the most conservative; Commercial is the largest but still bounded.
-- Larger presets use a **tighter** ATR spacing multiplier (levels fill sooner) and a **higher** drawdown circuit-breaker ceiling, matching larger capital and exposure appetite.
+**Invariant:** no order is ever sent without passing the SafetyValve, and the SafetyValve never closes or halts.
 
 ---
 
-## 4. Input Parameter Reference
+## 3. The Six Presets
 
-These match the input block in `AdaptiveGoldGrid.mq5`.
+Values below are the **exact defaults in `Config.mqh`**. Pick one in the `AccountPreset` input.
+
+| Parameter | NANO | MICRO | MEDIUM | LARGE | BIGLEVEL | COMMERCIAL |
+|---|---|---|---|---|---|---|
+| Target account size | ~$500–1.5k | ~$1.5k–5k | ~$5k–15k | ~$15k–50k | ~$50k–150k | ~$150k+ |
+| `base_lot` | 0.01 | 0.01 | 0.02 | 0.05 | 0.10 | 0.25 |
+| `max_grid_levels` | 3 | 4 | 5 | 6 | 7 | 8 |
+| `risk_percent_per_trade` (%) | 0.15 | 0.20 | 0.25 | 0.30 | 0.35 | 0.40 |
+| `lot_progression_factor` | **1.00** | 1.15 | 1.20 | 1.25 | 1.30 | 1.30 |
+| `max_lot_cap` | 0.01 | 0.02 | 0.05 | 0.15 | 0.40 | 1.00 |
+| `max_basket_exposure_lots` | **0.03** | 0.06 | 0.20 | 0.60 | 1.80 | 5.00 |
+| `atr_spacing_multiplier` | 2.00 | 1.80 | 1.60 | 1.50 | 1.40 | 1.35 |
+| `max_drawdown_percent` (%) | 15.0 | 18.0 | 20.0 | 22.0 | 25.0 | 28.0 |
+| `margin_level_floor_percent` (%) | 600 | 500 | 450 | 400 | 350 | 300 |
+| `min_free_margin_currency` | 10 | 20 | 100 | 300 | 1000 | 3000 |
+| `enable_basket_stop` | true | true | true | true | true | true |
+| `basket_stop_loss_percent` (%) | 8.0 | 10.0 | 10.0 | 12.0 | 12.0 | 15.0 |
+| `tp_decay_start_hours` | 8 | 12 | 12 | 12 | 12 | 12 |
+| `tp_decay_full_hours` | 48 | 96 | 96 | 96 | 96 | 96 |
+| `tp_decay_floor_fraction` | 0.15 | 0.15 | 0.15 | 0.15 | 0.15 | 0.15 |
+| `enable_partial_harvest` | true | true | true | true | true | true |
+| `harvest_min_leg_profit_ccy` | 0.30 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 |
+| `trail_activate_fraction` | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 |
+| `trail_giveback_fraction` | 0.35 | 0.35 | 0.35 | 0.35 | 0.35 | 0.35 |
+| `exposure_lots_per_1k` | 0.03 | 0.02 | 0.02 | 0.02 | 0.02 | 0.02 |
+| `recommended_min_equity` | 500 | 1500 | 5000 | 15000 | 50000 | 150000 |
+
+**`PRESET_NANO` is the preset for a ~$1000 account.** It uses a **flat `1.00` progression — no martingale multiplication at all** — only 3 levels, a 0.03-lot total exposure ceiling, and the tightest basket stop (8%).
+
+### Honest expectation for a $1000 account
+
+At 0.03 lots total exposure, a completed basket on gold is worth **single-digit dollars**. That is arithmetic, not a defect: small capital cannot produce large absolute returns without the risk of ruin that destroyed the v1 test. If the profit per basket looks too small to be interesting, the honest answer is that the account is too small for this instrument — not that the risk should be increased.
+
+---
+
+## 4. Input Reference
 
 ### General
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `AccountPreset` | `ENUM_ACCOUNT_PRESET` | `PRESET_MICRO` | Selects one of the five presets (Micro/Medium/Large/BigLevel/Commercial). |
-| `MagicNumber` | `long` | `20240517` | Isolates this EA's basket from other trades/EAs. |
-| `AnalysisTF` | `ENUM_TIMEFRAMES` | `PERIOD_M15` | Timeframe used for indicator analysis and the new-bar detector. |
+| Input | Default | Meaning |
+|---|---|---|
+| `AccountPreset` | `PRESET_NANO` | Selects one of the six presets. |
+| `MagicNumber` | `20240517` | Isolates this EA's basket. |
+| `AnalysisTF` | `PERIOD_M15` | Fast analysis timeframe. |
 
-### Logging
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `LogLevel` | `ENUM_LOG_LEVEL` | `LOG_INFO` | Log verbosity (ERROR/WARN/INFO/DEBUG). |
-| `EnableFileLog` | `bool` | `false` | Also append the log to a file under `MQL5/Files`. |
-| `LogFileName` | `string` | `"AdaptiveGoldGrid.log"` | Log file name (under `MQL5/Files`). |
-
-### Execution
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `SeedOnNewBarOnly` | `bool` | `true` | Seed a fresh basket only on a new bar (reduces churn). If false, may seed on any tick. |
-| `WarnIfNotGold` | `bool` | `true` | Warn (do not block) if the chart symbol is not XAUUSD/gold. |
+### Regime Filter — prevents counter-trend grids
+| Input | Default | Meaning |
+|---|---|---|
+| `EnableRegimeFilter` | `true` | Master switch. **Strongly recommended ON** — this is the main protection against the v1 blow-up. |
+| `RegimeTF` | `PERIOD_H1` | Higher timeframe for regime detection. |
+| `GridPolicy` | `POLICY_RANGING_ONLY` | Which regimes may seed: `RANGING_ONLY` (safest), `WITH_TREND_ONLY`, `RANGING_AND_TREND`. |
+| `RegimeAdxPeriod` | `14` | ADX period. |
+| `RegimeAdxTrend` | `22.0` | ADX above this ⇒ a trend exists. |
+| `RegimeAdxStrong` | `30.0` | ADX above this ⇒ strong trend. |
+| `RegimeEmaFast` / `RegimeEmaSlow` | `50` / `200` | Higher-TF EMA structure. |
+| `RegimeViolentRatio` | `1.80` | fast/slow ATR above this ⇒ stand aside entirely. |
 
 ### Basket Take-Profit
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `BasketTPMode` | `ENUM_BASKET_TP_MODE` | `BASKET_TP_CURRENCY` | Group TP mode: currency profit or points beyond break-even. |
-| `BasketTPCurrency` | `double` | `10.0` | (Currency mode) close basket when floating PnL is at or above this. |
-| `BasketTPPerLot` | `double` | `0.0` | (Currency mode) extra target per basket lot (scales the target with size). |
-| `BasketTPPoints` | `double` | `200.0` | (Points mode) close when price is this far beyond break-even. |
+| Input | Default | Meaning |
+|---|---|---|
+| `BasketTPMode` | `BASKET_TP_CURRENCY` | Currency profit, or points beyond break-even. |
+| `BasketTPCurrency` | `5.0` | (Currency mode) close basket when floating PnL ≥ this. |
+| `BasketTPPerLot` | `0.0` | (Currency mode) extra target per basket lot. |
+| `BasketTPPoints` | `200.0` | (Points mode) points beyond break-even. |
 
-### Hedging (optional)
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `EnableHedge` | `bool` | `false` | Enable the optional opposite-side hedge action. |
-| `HedgeTriggerDDPct` | `double` | `15.0` | Arm the hedge when basket floating drawdown reaches this % of equity. |
+### Active Recovery — Time-Decay TP
+| Input | Default | Meaning |
+|---|---|---|
+| `UseDecayOverride` | `false` | Override the preset's decay settings. |
+| `DecayStartHours` | `8.0` | Target starts shrinking after this basket age. |
+| `DecayFullHours` | `48.0` | Target reaches its floor at this age. |
+| `DecayFloorFraction` | `0.15` | Floor as a fraction of the original target. |
 
-### Optional ONNX ML (Phase-2, default OFF)
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `EnableOnnxML` | `bool` | `false` | Enable optional ONNX inference (advisory only; never bypasses the SafetyValve). |
-| `OnnxModelFile` | `string` | `""` | User-supplied `.onnx` model file under `MQL5/Files`. Empty means the hook stays NEUTRAL. |
+### Active Recovery — Trailing & Harvest
+| Input | Default | Meaning |
+|---|---|---|
+| `UseTrailOverride` | `false` | Override the preset's trailing settings. |
+| `TrailActivateFrac` | `0.70` | Arm trailing at this fraction of the target. |
+| `TrailGivebackFrac` | `0.35` | Close if this fraction of peak profit is given back. |
+| `UseHarvestOverride` | `false` | Override the preset's harvest settings. |
+| `EnablePartialHarvest` | `true` | Bank profitable legs to cut exposure. |
+| `HarvestMinLegProfit` | `0.30` | A leg must be at least this profitable to harvest. |
 
-### Advanced Overrides (leave off to use the preset)
-| Input | Type | Default | Meaning |
-|---|---|---|---|
-| `UseManualOverride` | `bool` | `false` | Override selected preset values with the fields below. |
-| `OverrideBaseLot` | `double` | `0.01` | Manual base lot (if override on). |
-| `OverrideMaxGridLevels` | `int` | `6` | Manual max grid levels (if override on). |
-| `OverrideLotProgression` | `double` | `1.30` | Manual lot progression factor (clamped to >= 1.0). |
-| `OverrideMaxLotCap` | `double` | `0.10` | Manual per-order lot cap. |
-| `OverrideMaxBasketLots` | `double` | `0.50` | Manual total-basket exposure cap. |
-| `OverrideAtrSpacingMult` | `double` | `1.50` | Manual ATR spacing multiplier. |
-| `OverrideMaxDrawdownPct` | `double` | `25.0` | Manual drawdown gate % (entry-blocking only). |
+### Basket Stop — bounded loss
+| Input | Default | Meaning |
+|---|---|---|
+| `UseStopOverride` | `false` | Override the preset's basket-stop settings. |
+| `EnableBasketStop` | `true` | Close a hopeless basket at a bounded loss and start fresh. |
+| `BasketStopLossPct` | `8.0` | Close basket when loss ≥ this % of **balance**. |
+
+### Capital-Aware Auto-Sizing
+| Input | Default | Meaning |
+|---|---|---|
+| `EnableCapitalSizing` | `true` | Derive the basket exposure cap from live equity. **Only ever shrinks** the preset caps, never enlarges them. |
+| `BlockIfUnderfunded` | `false` | Refuse to initialise if equity is below the preset's recommended minimum. |
+
+### Hedging, ML, and Sizing Overrides
+| Input | Default | Meaning |
+|---|---|---|
+| `EnableHedge` | `false` | Optional opposite-side hedge action. |
+| `HedgeTriggerDDPct` | `15.0` | Arm hedge when basket DD ≥ this % of balance. |
+| `EnableOnnxML` | `false` | Optional ONNX inference (advisory only). |
+| `OnnxModelFile` | `""` | `.onnx` model under `MQL5/Files`. |
+| `UseManualOverride` | `false` | Replace preset sizing with the `Override*` fields below it. |
+
+Logging: `LogLevel` (`LOG_INFO`), `EnableFileLog` (`false`), `LogFileName` (`AdaptiveGoldGrid.log`).
+Execution: `SeedOnNewBarOnly` (`true`), `WarnIfNotGold` (`true`).
 
 ---
 
-## 5. How the Adaptive Grid and Basket Recovery Work
+## 5. How the active recovery works
 
-### Adaptive grid spacing (ATR + volatility regimes)
-The base grid step is derived from volatility, never hardcoded:
+### Adaptive grid spacing
+```
+step_points = ATR_points x preset.atr_spacing_multiplier
+```
+Then adjusted by volatility regime: **VOL_HIGH** widens the step (don't stack into a fast move), **VOL_CALM** tightens it, **VOL_NORMAL** leaves it. A minimum-step floor prevents collapse to zero, and levels can snap to nearby swing S/R.
+
+### Regime-gated averaging — the most important change
+Once the higher timeframe is **trending against the basket**, the engine **stops enlarging it**. A SELL basket in `REGIME_TREND_UP` gets no more levels; a BUY basket in `REGIME_TREND_DOWN` gets no more levels; `REGIME_VIOLENT` suspends averaging entirely. Nothing is closed by this gate — the basket simply stops growing, which caps the exposure the stop/recovery logic then has to resolve. This is what breaks the "average into a trend until dead" spiral.
+
+### Time-decay take-profit — the fix for "stuck for 30 days"
+The group target **shrinks with basket age**:
 
 ```
-step_points = ATR_points * preset.atr_spacing_multiplier
+age <= decay_start        ->  full target
+decay_start < age < full  ->  linear ramp down
+age >= decay_full         ->  floor_fraction x target
 ```
 
-MarketAnalysis classifies the current ATR into a **volatility regime** using its percentile over a recent lookback window:
+With `PRESET_NANO` a basket older than 48 hours is trying to escape at **15% of its original target**, so a stale basket exits at a small profit instead of waiting weeks for a full-size target the market may never hand back.
 
-- **VOL_HIGH** (ATR percentile >= 0.66) → **widen** the step so the grid does not stack levels into a fast move.
-- **VOL_CALM** (ATR percentile <= 0.33) → **tighten** the step so levels fill in quiet ranges.
-- **VOL_NORMAL** → leave the step as-is.
+### Partial harvest — with an honest caveat
+When a basket is **aging** or **trend-trapped** (averaging refused), the engine banks the most profitable leg to realise cash and cut exposure.
 
-A minimum-step floor prevents spacing from collapsing to zero, and the engine can snap a level to a nearby swing support/resistance when price is within a fraction of a step.
+> **Caveat:** harvesting the best-priced legs slightly **worsens the weighted average** of what remains. It is a **survival-over-recovery** trade — the right trade for a small account, but a real trade-off. It is configurable and can be turned off.
 
-### Seed direction
-With no basket open, the seed direction comes from the consolidated `MarketContext` (fast/slow EMA relationship + slope for trend, plus a blended RSI/MACD momentum score). This is a structure-biased entry, not a coin flip. Once a basket exists, additional levels are added on the same recovery side.
+### Basket trailing
+Once the basket reaches `trail_activate_fraction` of its (decayed) target, giving back `trail_giveback_fraction` of the peak closes it **in profit**. Trailing is currency-based; in points mode it stays off unless you also set `BasketTPCurrency`.
 
-### Basket recovery (group TP, averaging, optional hedge)
-The EA thinks in **baskets**, not single trades. A basket is every position sharing the EA's magic number and symbol, managed as one group:
-
-1. **Group take-profit first.** Each tick the RecoveryEngine checks whether the basket's floating PnL has reached the configured target (currency or points beyond weighted-average break-even). When it has, `CloseBasket()` closes the whole group **in profit**. This is the only close the engine ever issues.
-2. **Averaging.** If price has moved one adaptive step adverse and there is grid depth (`max_grid_levels`) and exposure room left, the engine proposes a bounded averaging add on the recovery side to pull the weighted-average entry closer to price.
-3. **Optional hedge.** If `EnableHedge` is on and basket floating drawdown reaches `HedgeTriggerDDPct`, the engine proposes a single opposite-side hedge to cap further adverse bleed while the primary side waits to recover.
-4. **Hold.** If none of the above apply (for example, exposure caps are hit), the engine simply holds and waits for the market to return to the break-even target. Holding is a deliberate state, not a bug, and no loss is ever realized.
-
-Every proposed add is only an **intent**; the main EA still gates it through the Safety Valve before any order is sent.
+### Basket stop
+The only path in the EA that realises a loss. Fires when the basket's floating loss reaches `basket_stop_loss_percent` of **balance** (balance, not equity — equity already contains the loss being measured, which would make the ratio accelerate and trip inconsistently). Closes the whole basket and starts fresh.
 
 ---
 
-## 6. The Safety Valve
+## 6. Where a loss can be realised (audit trail)
 
-The Safety Valve is a **gate, not a kill-switch**. Each tick it answers exactly one question: *"Is it safe to open a NEW grid / recovery order right now?"*
+Close **mechanism** lives in `OrderManager`; close **policy** lives only in `RecoveryEngine`. There are exactly four gated close sites and no `ExpertRemove` anywhere:
 
-It blocks **new entries** when any of these thresholds are crossed (values come from the active preset):
-- **Drawdown circuit breaker**: equity drawdown from the tracked peak reaches `max_drawdown_percent`.
-- **Margin level floor**: `ACCOUNT_MARGIN_LEVEL` falls below `margin_level_floor_percent` (only enforced when margin is actually in use).
-- **Free-margin minimum**: `ACCOUNT_MARGIN_FREE` falls below `min_free_margin_currency`.
-- **Projected margin**: the free margin that *would remain* after the intended next order would breach the minimum.
+| Site | Gate | Outcome |
+|---|---|---|
+| Group take-profit | `GroupTargetReached()` requires `pnl > 0` | **Profit** |
+| Basket trailing | `pnl > 0 && pnl <= giveback_level` | **Profit** |
+| **Basket stop** | `enable_basket_stop && pnl < 0 && dd% >= threshold` | **Bounded loss** (opt-in) |
+| Partial harvest | `MostProfitableLeg(min_profit)` — leg must be profitable | **Profit** |
 
-Non-negotiable semantics, stated plainly:
-- It **NEVER force-closes** a position (no close-at-loss, ever).
-- It **NEVER modifies** an existing trade.
-- It **NEVER halts** the EA (no `ExpertRemove`, no account halt).
-- It **NEVER realizes a loss**.
-
-**Why it works this way:** this is a grid + basket-recovery system. The recovery basket needs room (free margin and surviving equity) to work its way back to profit. Force-closing at a loss or halting would lock in the drawdown and defeat the entire recovery model. So the only protective action is to **stop adding new exposure** until the account has breathing room again. Blocking new entries keeps the account alive so the existing basket can recover and close in profit. **This is a precondition for recovery, not a defeat.**
+`SafetyValve.mqh` contains **no close or halt call of any kind** and only ever blocks new entries.
 
 ---
 
-## 7. RISK WARNING (READ THIS)
+## 7. RISK WARNING
 
 **Grid + martingale strategies carry a real risk of large drawdown and total account loss.**
 
-- Even though the Safety Valve stops opening new orders when the account is stressed, **it cannot close the existing basket at a profit if the market never comes back.** A strong, sustained trend against the basket can grow the floating loss until your **broker forces a stop-out** and liquidates positions at a loss, regardless of anything this EA does.
-- **"The basket always closes in profit" is NOT guaranteed.** It is the intended closing behavior of the recovery engine, but the account can still be blown up by an adverse move before that ever happens. The design keeps the account alive as long as possible; it does not make losses impossible.
-- Deeper grid levels use progressively larger lots (bounded, but still larger). Exposure and margin usage can climb quickly during a losing sequence.
-- News spikes, gaps, weekend risk, widened spreads, slippage, swap costs, and broker-specific stop-out levels can all cause outcomes far worse than a clean backtest suggests.
+- The basket stop bounds the loss **per basket**, not per account. A long series of stopped baskets still draws the account down.
+- If you **disable** the basket stop, you restore the v1 failure mode: a basket trapped against a trend holds indefinitely and the floating loss can grow until the **broker stops the account out**, regardless of anything this EA does.
+- Deeper grid levels use progressively larger lots on every preset except `PRESET_NANO` (which is flat).
+- News spikes, gaps, weekend risk, widened spreads, slippage, swap costs, and broker-specific stop-out levels can all produce outcomes far worse than a clean backtest suggests.
+- **Nothing here guarantees profit.** "Profit regardless of market direction" is not achievable and is not attempted.
 
-**Mitigate this by:** using a conservative preset for your capital, backtesting thoroughly on real-tick data across multiple years and market regimes, forward-testing on a demo account, and never risking money you cannot afford to lose. **You must backtest thoroughly before considering live use.**
-
----
-
-## 8. ONNX / ML Phase-2 Hook (Optional, Inference-Only)
-
-`MLHook.mqh` provides an **optional, disabled-by-default** ONNX inference hook. Honest facts about it:
-
-- **MQL5 cannot train** an LSTM/CNN/GRU or any neural network. There is no training runtime in the terminal. You must train **outside** MT5 (for example Python + PyTorch/TensorFlow) and export to the `.onnx` format yourself.
-- MQL5 can only run **inference** via `OnnxCreate()` → `OnnxRun()` → `OnnxRelease()`. That is the only thing this hook does.
-- The classical indicators in `MarketAnalysis.mqh` are ordinary deterministic math and are **never** relabeled or presented as "ML confidence". A genuine ML signal comes only from a real trained model run through `OnnxRun()`.
-- When `EnableOnnxML=false` (default), or when `OnnxModelFile` is empty, or before the Phase-2 tensor plumbing is completed, `Predict()` returns a **NEUTRAL "no opinion"** result and the classical Phase-1 logic runs completely unchanged.
-- Even when active, the hook is **advisory only**: it may only bias/confirm (veto a disagreeing seed). It can never open, modify, or close an order, and it can **never bypass the Safety Valve**.
-
-To finish Phase-2 you would (see the `// TODO(Phase-2)` markers in `MLHook.mqh`): define the model input/output tensor shapes, apply the same normalization used at training time, call `OnnxRun`, and parse the output into a real confidence in `[0,1]`.
+**Mitigate by:** using a preset appropriate to your capital (`PRESET_NANO` for ~$1000), keeping the regime filter and basket stop enabled, backtesting on real-tick data across multiple years and regimes, forward-testing on demo, and never risking money you cannot afford to lose.
 
 ---
 
-## 9. Install, Compile (F7), and Backtest (Strategy Tester)
+## 8. ONNX / ML Phase-2 hook (optional, inference-only)
 
-### Install (place folders under the MT5 data folder)
-1. In MetaTrader 5, open **File → Open Data Folder**. This opens `<MT5 data folder>`.
-2. Copy the source tree so it mirrors the MT5 `MQL5` layout:
-   - `Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5` → `<MT5>/MQL5/Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5`
-   - `Include/AdaptiveGoldGrid/*.mqh` → `<MT5>/MQL5/Include/AdaptiveGoldGrid/*.mqh`
-3. In MetaEditor, refresh the Navigator so it sees the new files.
+- **MQL5 cannot train** an LSTM/CNN/GRU or any neural network. Train outside MT5 (e.g. Python + PyTorch/TensorFlow) and export to `.onnx` yourself.
+- MQL5 can only run **inference** via `OnnxCreate()` → `OnnxRun()` → `OnnxRelease()`. That is all this hook does.
+- The classical indicators in `MarketAnalysis.mqh` and `RegimeFilter.mqh` are ordinary deterministic math and are **never** relabelled as "ML confidence".
+- With `EnableOnnxML=false` (default) or an empty `OnnxModelFile`, `Predict()` returns **NEUTRAL** and the classical logic runs unchanged.
+- Even when active it is **advisory only**: it may veto a disagreeing seed. It can never open, modify or close an order, and never bypasses the SafetyValve.
 
-### Compile (F7)
-1. Open MetaEditor (from MT5: **Tools → MetaQuotes Language Editor**, or press F4).
-2. Open `MQL5/Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5`.
-3. Press **F7** (Compile). Fix any reported issues. A successful compile produces `AdaptiveGoldGrid.ex5` next to the `.mq5`.
-   - Do **not** commit the generated `.ex5`; it is a local build artifact.
-
-### Backtest (Strategy Tester) on XAUUSD
-1. In MT5 open **View → Strategy Tester** (Ctrl+R).
-2. Select the Expert **AdaptiveGoldGrid**.
-3. Symbol: **XAUUSD** (or your broker's gold symbol, e.g. `GOLD`, `XAUUSD.m`).
-4. Timeframe: **M5** or **M15** (match `AnalysisTF`).
-5. Modeling: **Every tick based on real ticks** for the most realistic fills.
-6. Choose a multi-year date range that includes trends, ranges, and news events.
-7. Start with **`AccountPreset = PRESET_MICRO`** and default inputs.
-8. Run, then review the equity curve, maximum drawdown, and margin-level behavior. Only after thorough backtesting and demo forward-testing should you consider a small live/demo trial.
+See the `// TODO(Phase-2)` markers in `MLHook.mqh` for the remaining tensor-shaping, normalisation, run and parse steps.
 
 ---
 
-## 10. Verified vs. Not Verified
+## 9. Install, Compile (F7), and Backtest
 
-**Verified in this environment (by inspection only):**
-- Module structure, include guards, and cross-module include paths were reviewed by reading the source.
-- The main EA declares `OnInit` / `OnTick` / `OnDeinit` and a complete input block.
-- Logic flow was reviewed: SafetyValve is entry-blocking only, RecoveryEngine's only close is the profit-only `CloseBasket()`, and the ONNX hook is disabled by default and cannot bypass the SafetyValve.
-- The preset table in this README was cross-checked field-by-field against the literal defaults in `Config.mqh`.
+### Install
+1. In MT5: **File → Open Data Folder**.
+2. Copy the tree to mirror the MT5 layout:
+   - `Experts/AdaptiveGoldGrid/AdaptiveGoldGrid.mq5` → `<MT5>/MQL5/Experts/AdaptiveGoldGrid/`
+   - `Include/AdaptiveGoldGrid/*.mqh` → `<MT5>/MQL5/Include/AdaptiveGoldGrid/`
+3. Refresh the MetaEditor Navigator.
 
-**NOT verified (your responsibility):**
-- **Compilation was NOT performed.** There is no MQL5 compiler, MetaEditor, MetaTrader 5, or wine in the build environment, so the EA could not be compiled here. You must compile it yourself with MetaEditor (F7).
-- **Backtesting was NOT performed.** No Strategy Tester exists here. You must backtest and forward-test the EA yourself on XAUUSD as described in section 9.
-- Runtime behavior, broker-specific fills, margin math on your account, and profitability were **not** validated and cannot be inferred from static inspection.
+### Compile
+1. Open MetaEditor (F4 from MT5).
+2. Open `AdaptiveGoldGrid.mq5`.
+3. Press **F7**. A successful compile produces `AdaptiveGoldGrid.ex5`. Do not commit the `.ex5`.
+
+### Backtest
+1. **View → Strategy Tester** (Ctrl+R).
+2. Expert: **AdaptiveGoldGrid**. Symbol: **XAUUSD** (or your broker's gold symbol).
+3. Timeframe **M15** (match `AnalysisTF`); modelling **Every tick based on real ticks**.
+4. Choose a multi-year range containing trends, ranges and news events.
+5. Start with `AccountPreset = PRESET_NANO`, `EnableRegimeFilter = true`, `EnableBasketStop = true`, and a $1000 starting deposit.
+6. Review the equity curve, **maximum drawdown**, margin-level behaviour, and how often the basket stop fires. Only after thorough backtesting and demo forward-testing should you consider live use.
+
+---
+
+## 10. Verified vs. NOT verified
+
+**Verified in the build environment (static inspection only):**
+- Braces and parentheses balance in all 11 source files (comments/strings excluded).
+- All 10 `.mqh` files have matching `#ifndef`/`#define`/`#endif` guards; the `.mq5` correctly has none.
+- All **21** `PresetProfile` fields are assigned in **all six** preset paths (no uninitialised fields).
+- Cross-module call arity matches definitions (`RegimeFilter.Init` 11/11, `RecoveryEngine.Init` 7/7, `RecoveryEngine.Manage` 2/2).
+- Every `RECOVERY_*` action used by the EA exists in the enum.
+- Close-path audit: four gated close sites as tabulated in section 6; `SafetyValve` contains no close/halt; no `ExpertRemove` anywhere.
+- No illegal C idioms (`(void)expr;`), no `std::`, no exceptions.
+- README preset table cross-checked against `Config.mqh` literals.
+
+**NOT verified — your responsibility:**
+- **Compilation was NOT performed.** There is no MQL5 compiler, MetaEditor, MT5 or wine in the build environment. Compile it yourself (F7).
+- **Backtesting was NOT performed.** No Strategy Tester exists here. Backtest and forward-test yourself on XAUUSD.
+- Runtime behaviour, broker-specific fills and contract specs, margin maths on your account, and profitability were **not** validated and cannot be inferred from static inspection.
+- Gold tick value/contract size vary by broker (per-ounce vs per-100-oz, plus account-currency conversion). Verify the seed lot against your broker's specs in the Strategy Tester.
 
 Treat every result as unverified until you have compiled and backtested it yourself.

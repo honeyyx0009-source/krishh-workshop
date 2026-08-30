@@ -12,9 +12,15 @@
 //|         recovery logic can treat all EA positions as one group,   |
 //|     (d) profit-taking close helpers.                              |
 //|                                                                  |
-//|   IMPORTANT: CloseBasket()/ClosePartial() exist ONLY to realise   |
-//|   PROFIT (group take-profit). The safety logic never calls them   |
-//|   to realise a loss.                                              |
+//|   v2 IMPORTANT - CLOSE SEMANTICS CHANGED:                         |
+//|   The close helpers here are pure MECHANISM: they close whatever   |
+//|   they are told to close, at whatever the current PnL happens to   |
+//|   be. They enforce no policy of their own.                        |
+//|   ALL close POLICY lives in RecoveryEngine.mqh, which calls them   |
+//|   from exactly four gated places: group take-profit (in profit),   |
+//|   basket trailing (in profit), the opt-in basket stop (bounded     |
+//|   loss), and harvesting a single profitable leg.                   |
+//|   The SafetyValve still never closes anything at all.             |
 //+------------------------------------------------------------------+
 #ifndef ADAPTIVEGRID_ORDERMANAGER_MQH
 #define ADAPTIVEGRID_ORDERMANAGER_MQH
@@ -447,12 +453,102 @@ public:
       return(be);
      }
 
+   //--- Open time of the OLDEST position in the basket (0 if none).
+   //    Used by the RecoveryEngine to age a basket for the time-decay
+   //    take-profit, so a stale basket can escape at a smaller target
+   //    instead of being stuck for weeks.
+   datetime          BasketOldestOpenTime(void) const
+     {
+      datetime oldest = 0;
+      int total=PositionsTotal();
+      for(int i=0;i<total;i++)
+        {
+         ulong tk=PositionGetTicket(i);
+         if(tk==0) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=m_magic) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=m_symbol) continue;
+         datetime t=(datetime)PositionGetInteger(POSITION_TIME);
+         if(oldest==0 || t<oldest) oldest=t;
+        }
+      return(oldest);
+     }
+
+   //--- Basket age in hours (0 when there is no basket).
+   double            BasketAgeHours(void) const
+     {
+      datetime oldest = BasketOldestOpenTime();
+      if(oldest==0) return(0.0);
+      long secs = (long)(TimeCurrent() - oldest);
+      if(secs<0) secs=0;
+      return((double)secs/3600.0);
+     }
+
+   //--- Find the MOST PROFITABLE leg in the basket.
+   //    Returns true and fills ticket/profit/volume when a leg with
+   //    profit strictly above `min_profit` exists. Used by the partial
+   //    harvest logic to bank a winning leg and cut exposure.
+   bool              MostProfitableLeg(const double min_profit,ulong &ticket,
+                                       double &profit,double &volume) const
+     {
+      ticket = 0;
+      profit = 0.0;
+      volume = 0.0;
+      bool found=false;
+      int total=PositionsTotal();
+      for(int i=0;i<total;i++)
+        {
+         ulong tk=PositionGetTicket(i);
+         if(tk==0) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=m_magic) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=m_symbol) continue;
+         double pr = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         if(pr <= min_profit) continue;
+         if(!found || pr > profit)
+           {
+            found  = true;
+            ticket = tk;
+            profit = pr;
+            volume = PositionGetDouble(POSITION_VOLUME);
+           }
+        }
+      return(found);
+     }
+
+   //--- Close ONE position entirely by ticket (used by partial harvest
+   //    to bank a single profitable leg). Retries transient errors.
+   bool              ClosePosition(const ulong ticket)
+     {
+      for(int attempt=1;attempt<=m_max_retries;attempt++)
+        {
+         bool ok=m_trade.PositionClose(ticket);
+         uint rc=m_trade.ResultRetcode();
+         if(ok && (rc==TRADE_RETCODE_DONE||rc==TRADE_RETCODE_PLACED))
+            return(true);
+         if(!IsTransient(rc))
+            return(false);
+         Sleep(m_retry_sleep_ms);
+        }
+      return(false);
+     }
+
    //================================================================//
-   //  (d) PROFIT-TAKING CLOSE HELPERS                               //
-   //  NOTE: These are used ONLY to realise profit (group TP).       //
-   //        The SafetyValve never invokes these to realise a loss.  //
+   //  (d) BASKET CLOSE HELPERS                                      //
+   //                                                                //
+   //  v2 NOTE ON SEMANTICS - this changed from v1 and it matters:    //
+   //    In v1 CloseBasket() was documented as profit-only, and the   //
+   //    RecoveryEngine only ever called it when basket PnL > 0. That  //
+   //    guaranteed no loss was ever realised - and that is exactly    //
+   //    why a basket on the wrong side of a trend held until the      //
+   //    account died.                                                //
+   //                                                                //
+   //    In v2 this helper is MECHANISM ONLY: it closes the basket     //
+   //    whatever the PnL. The POLICY of when closing is allowed lives  //
+   //    entirely in the RecoveryEngine, which calls it from exactly   //
+   //    two places: the group take-profit path (in profit) and the    //
+   //    basket stop path (bounded loss, and only when the basket stop  //
+   //    is enabled). The SafetyValve still never closes anything.     //
    //================================================================//
-   //--- Close every position in the basket (group take-profit).
+   //--- Close every position in the basket.
    bool              CloseBasket(void)
      {
       bool all_ok=true;
